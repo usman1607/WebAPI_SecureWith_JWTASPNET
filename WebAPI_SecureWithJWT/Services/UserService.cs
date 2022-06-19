@@ -1,14 +1,17 @@
-﻿using Microsoft.AspNetCore.Identity;
+﻿using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using System;
 using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
+using System.Security.Cryptography;
 using System.Linq;
 using System.Security.Claims;
 using System.Text;
 using System.Threading.Tasks;
 using WebAPI_SecureWithJWT.Constants;
+using WebAPI_SecureWithJWT.Contexts;
 using WebAPI_SecureWithJWT.Models;
 using WebAPI_SecureWithJWT.Settings;
 
@@ -18,12 +21,15 @@ namespace WebAPI_SecureWithJWT.Services
     {
         private readonly UserManager<ApplicationUser> _userManager;
         private readonly RoleManager<IdentityRole> _roleManager;
+        private readonly ApplicationDbContext _context;
+        private readonly HttpResponse _response;
         private readonly JWT _jwt;
-        public UserService(UserManager<ApplicationUser> userManager, RoleManager<IdentityRole> roleManager, IOptions<JWT> jwt)
+        public UserService(UserManager<ApplicationUser> userManager, RoleManager<IdentityRole> roleManager, ApplicationDbContext context, IOptions<JWT> jwt)
         {
             _userManager = userManager;
             _roleManager = roleManager;
             _jwt = jwt.Value;
+            _context = context;
         }
 
         public async Task<AuthenticationModel> GetTokenAsync(TokenRequestModel model)
@@ -45,11 +51,70 @@ namespace WebAPI_SecureWithJWT.Services
                 authenticationModel.UserName = user.UserName;
                 var rolesList = await _userManager.GetRolesAsync(user).ConfigureAwait(false);
                 authenticationModel.Roles = rolesList.ToList();
+
+                if (user.RefreshTokens.Any(a => a.IsActive))
+                {
+                    var activeRefreshToken = user.RefreshTokens.Where(a => a.IsActive).FirstOrDefault();
+                    authenticationModel.RefreshToken = activeRefreshToken.Token;
+                    authenticationModel.RefreshTokenExpiration = activeRefreshToken.Expires;
+                }
+                else
+                {
+                    var refreshToken = CreateRefreshToken();
+                    authenticationModel.RefreshToken = refreshToken.Token;
+                    authenticationModel.RefreshTokenExpiration = refreshToken.Expires;
+                    user.RefreshTokens.Add(refreshToken);
+                    _context.Update(user);
+                    _context.SaveChanges();
+                }
+
                 return authenticationModel;
             }
             authenticationModel.IsAuthenticated = false;
             authenticationModel.Message = $"Incorrect Credentials for user {user.Email}.";
             return authenticationModel;
+        }
+
+        public async Task<AuthenticationModel> RefreshTokenAsync(string token)
+        {
+            var authenticationModel = new AuthenticationModel();
+            var user = _context.Users.SingleOrDefault(u => u.RefreshTokens.Any(t => t.Token == token));
+            if (user == null)
+            {
+                authenticationModel.IsAuthenticated = false;
+                authenticationModel.Message = $"Token did not match any users.";
+                return authenticationModel;
+            }
+            var refreshToken = user.RefreshTokens.Single(x => x.Token == token);
+            if (!refreshToken.IsActive)
+            {
+                authenticationModel.IsAuthenticated = false;
+                authenticationModel.Message = $"Token Not Active.";
+                return authenticationModel;
+            }
+            //Revoke Current Refresh Token
+            refreshToken.Revoked = DateTime.UtcNow;
+            //Generate new Refresh Token and save to Database
+            var newRefreshToken = CreateRefreshToken();
+            user.RefreshTokens.Add(newRefreshToken);
+            _context.Update(user);
+            _context.SaveChanges();
+            //Generates new jwt
+            authenticationModel.IsAuthenticated = true;
+            JwtSecurityToken jwtSecurityToken = await CreateJwtToken(user);
+            authenticationModel.Token = new JwtSecurityTokenHandler().WriteToken(jwtSecurityToken);
+            authenticationModel.Email = user.Email;
+            authenticationModel.UserName = user.UserName;
+            var rolesList = await _userManager.GetRolesAsync(user).ConfigureAwait(false);
+            authenticationModel.Roles = rolesList.ToList();
+            authenticationModel.RefreshToken = newRefreshToken.Token;
+            authenticationModel.RefreshTokenExpiration = newRefreshToken.Expires;
+            return authenticationModel;
+        }
+
+        public ApplicationUser GetById(string id)
+        {
+            return _context.Users.Find(id);
         }
 
         private async Task<JwtSecurityToken> CreateJwtToken(ApplicationUser user)
@@ -125,6 +190,36 @@ namespace WebAPI_SecureWithJWT.Services
                 return $"Role {model.Role} not found.";
             }
             return $"Incorrect Credentials for user {user.Email}.";
+        }
+
+        private RefreshToken CreateRefreshToken()
+        {
+            var randomNumber = new byte[32];
+            using (var generator = new RNGCryptoServiceProvider())
+            {
+                generator.GetBytes(randomNumber);
+                return new RefreshToken
+                {
+                    Token = Convert.ToBase64String(randomNumber),
+                    Expires = DateTime.UtcNow.AddDays(10),
+                    Created = DateTime.UtcNow
+                };
+            }
+        }
+
+        public bool RevokeToken(string token)
+        {
+            var user = _context.Users.SingleOrDefault(u => u.RefreshTokens.Any(t => t.Token == token));
+            // return false if no user found with token
+            if (user == null) return false;
+            var refreshToken = user.RefreshTokens.Single(x => x.Token == token);
+            // return false if token is not active
+            if (!refreshToken.IsActive) return false;
+            // revoke token and save
+            refreshToken.Revoked = DateTime.UtcNow;
+            _context.Update(user);
+            _context.SaveChanges();
+            return true;
         }
     }
 }

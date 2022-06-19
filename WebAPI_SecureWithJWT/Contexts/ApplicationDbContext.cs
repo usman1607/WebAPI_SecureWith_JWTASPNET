@@ -9,5 +9,8 @@ namespace WebAPI_SecureWithJWT.Contexts
         public ApplicationDbContext(DbContextOptions<ApplicationDbContext> options) : base(options)
         {
         }
+
+        public DbSet<ApplicationUser> ApplicationUsers { get; set; }
+        //public DbSet<RefreshToken> RefreshTokens { get; set; }
     }
 }
